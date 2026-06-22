@@ -1,0 +1,17 @@
+{
+  "name": "reviewrequest-tax-guidance-backend",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "cors": "latest",
+    "dotenv": "latest",
+    "express": "latest",
+    "openai": "latest"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
