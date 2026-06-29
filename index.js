@@ -7,7 +7,7 @@ const OpenAI = require('openai');
 const app = express();
 
 app.use(cors());
-app.use(express.json({ limit: '3mb' }));
+app.use(express.json({ limit: '2mb' }));
 
 app.use((req, res, next) => {
   console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
@@ -20,6 +20,10 @@ const client = new OpenAI({
 
 const TAX_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 const INSIGHTS_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
+
+const taxCache = new Map();
+const CACHE_TTL_MS = 1000 * 60 * 30;
+const MAX_CACHE_ITEMS = 100;
 
 app.get('/', (req, res) => {
   res.send('ReviewRequest Tax Guidance backend is running.');
@@ -36,97 +40,47 @@ app.post('/tax-search', async (req, res) => {
       query
     } = req.body;
 
-    console.log('Tax search body:', {
-      stateCode,
-      stateName,
-      taxYear,
-      clientType,
-      depth,
-      query
-    });
-
     if (!query || !String(query).trim()) {
-      return res.status(400).json({
-        error: 'Missing query.'
-      });
+      return res.status(400).json({ error: 'Missing query.' });
     }
 
     const normalizedDepth = ['quick', 'standard', 'deep'].includes(depth)
       ? depth
       : 'standard';
 
-    const depthRules = getDepthRules(normalizedDepth);
+    const cleanQuery = String(query).trim();
 
-    const prompt = `
-You are ReviewRequest Tax Guidance, a CPA-focused tax research assistant.
+    const cacheKey = JSON.stringify({
+      stateCode,
+      stateName,
+      taxYear,
+      clientType,
+      depth: normalizedDepth,
+      query: cleanQuery.toLowerCase()
+    });
 
-Your job:
-Give practical, accurate, CPA-useful tax guidance with low fluff.
+    const cached = getCached(cacheKey);
+    if (cached) {
+      return res.json({ result: cached, cached: true });
+    }
 
-Return ONLY valid JSON.
-No markdown.
-No commentary outside JSON.
-No trailing commas.
-
-Research target:
-- State: ${stateName || 'Federal only'} (${stateCode || 'US'})
-- Tax year: ${taxYear || 'current'}
-- Client type: ${clientType || 'General'}
-- Depth: ${normalizedDepth}
-- Question: ${query}
-
-Critical accuracy rules:
-- First, check whether the fact pattern makes sense for the selected client type.
-- If the selected client type and question are inconsistent, flag it clearly.
-- Do not pretend an unrealistic fact pattern is normal.
-- Example: unemployment compensation is generally paid to individuals, not C corporations. If client type is C corporation, explain that the selected client type is likely wrong or that the relevant recipient may be an employee, shareholder, or owner.
-- Separate federal treatment from state treatment when both matter.
-- Distinguish rules that are likely known from items that must be verified.
-- Do not invent exact Code sections, publication numbers, forms, or URLs unless you are confident.
-- If you are not confident about a source URL, leave url as an empty string and give the source title to verify.
-- Do not provide legal certainty where verification is required.
-- Do not give generic disclaimers. Be specific about what must be checked.
-
-CPA usefulness rules:
-- Give the likely answer first.
-- Explain the return-preparation impact.
-- Explain documentation or workpaper impact.
-- Include practical review steps.
-- Include common mistakes.
-- Include client follow-up questions where useful.
-- Keep wording direct and professional.
-
-Depth rules:
-${depthRules}
-
-Return this exact JSON shape:
-{
-  "state": "state or Federal",
-  "taxYear": "tax year",
-  "confidence": "High | Medium | Low",
-  "factPatternWarning": "clear warning if the facts/client type are unusual, otherwise empty string",
-  "summary": "plain-English rule summary",
-  "federalTreatment": "federal treatment if relevant, otherwise empty string",
-  "stateTreatment": "state-specific treatment if relevant, otherwise empty string",
-  "cpaImpact": "what this means for the CPA's review work",
-  "affectedClients": ["client type or fact pattern"],
-  "actionItems": ["specific next step"],
-  "clientQuestions": ["question to ask the client"],
-  "documentation": ["documents or records to review"],
-  "risks": ["risk or uncertainty to verify"],
-  "commonMistakes": ["common mistake to avoid"],
-  "sources": [
-    { "title": "official source title to verify", "url": "" }
-  ]
-}
-`;
+    const prompt = buildTaxPrompt({
+      stateCode,
+      stateName,
+      taxYear,
+      clientType,
+      depth: normalizedDepth,
+      query: cleanQuery
+    });
 
     const response = await withTimeout(
       client.responses.create({
         model: TAX_MODEL,
-        input: prompt
+        input: prompt,
+        temperature: 0.1,
+        max_output_tokens: getMaxOutputTokens(normalizedDepth)
       }),
-      40000
+      getTimeoutMs(normalizedDepth)
     );
 
     const raw = response.output_text || '';
@@ -134,8 +88,11 @@ Return this exact JSON shape:
 
     const result = normalizeTaxResult(parsed, raw, {
       stateName,
-      taxYear
+      taxYear,
+      depth: normalizedDepth
     });
+
+    setCached(cacheKey, result);
 
     res.json({ result });
   } catch (error) {
@@ -152,32 +109,29 @@ app.post('/ai-insights', async (req, res) => {
     const { hiddenSummary } = req.body;
 
     if (!hiddenSummary) {
-      return res.status(400).json({
-        error: 'Missing hiddenSummary.'
-      });
+      return res.status(400).json({ error: 'Missing hiddenSummary.' });
     }
 
     const response = await withTimeout(
       client.responses.create({
         model: INSIGHTS_MODEL,
+        temperature: 0.1,
+        max_output_tokens: 700,
         input: `
-You are a CPA financial analyst writing a short internal review memo.
-
-Rewrite the analysis below into a polished CPA-style narrative.
+You are a CPA financial analyst. Rewrite the analysis below into a polished internal review memo.
 
 Rules:
-- Do not include disclaimers, limitations, notes, or signatures.
+- No disclaimers, notes, signatures, or bullet points.
 - Do not mention that the analysis is based on provided data.
-- Do not use bullet points.
-- Prioritize the most important review issues first.
+- Prioritize the biggest review issues.
 - Focus on financial meaning, not just number changes.
-- Keep it concise: 1 to 2 short paragraphs.
+- Keep it to 1-2 short paragraphs.
 
 Analysis:
 ${hiddenSummary}
 `
       }),
-      40000
+      25000
     );
 
     res.json({
@@ -192,51 +146,116 @@ ${hiddenSummary}
   }
 });
 
+function buildTaxPrompt({
+  stateCode,
+  stateName,
+  taxYear,
+  clientType,
+  depth,
+  query
+}) {
+  return `
+You are ReviewRequest Tax Guidance, a CPA-focused tax assistant.
+
+Return ONLY valid JSON. No markdown. No commentary. No trailing commas.
+
+Target:
+State: ${stateName || 'Federal only'} (${stateCode || 'US'})
+Tax year: ${taxYear || 'current'}
+Client type: ${clientType || 'General'}
+Depth: ${depth}
+Question: ${query}
+
+Accuracy rules:
+- Give the likely answer first.
+- Check if the fact pattern fits the selected client type.
+- If facts are unusual, set factPatternWarning and explain it in summary.
+- Future tax years: do not use "High" confidence unless the rule is highly stable. Prefer "Medium" and say future guidance should be verified.
+- Separate federal and state treatment when both matter.
+- Do not invent exact Code sections, publication numbers, form numbers, or URLs unless confident.
+- If source URL is uncertain, leave url as "".
+- Source titles must be specific official documents, forms, instructions, topics, publications, statutes, regulations, or agency pages. Avoid vague source titles.
+- Be practical for CPA return prep, review, documentation, and client follow-up.
+
+Depth rules:
+${getDepthRules(depth)}
+
+JSON shape:
+{
+  "state": "",
+  "taxYear": "",
+  "confidence": "High | Medium | Low",
+  "factPatternWarning": "",
+  "summary": "",
+  "federalTreatment": "",
+  "stateTreatment": "",
+  "cpaImpact": "",
+  "affectedClients": [],
+  "actionItems": [],
+  "clientQuestions": [],
+  "documentation": [],
+  "risks": [],
+  "commonMistakes": [],
+  "sources": [
+    { "title": "", "url": "" }
+  ]
+}
+`;
+}
+
 function getDepthRules(depth) {
   if (depth === 'quick') {
     return `
-Quick mode:
-- Summary must be 3-5 sentences.
-- Federal treatment: 1-2 sentences max.
-- State treatment: 1-2 sentences max.
-- CPA impact: 2-3 sentences max.
-- Action items: 2-3 items.
-- Client questions: 1-3 items.
-- Documentation: 1-3 items.
-- Risks: 1-2 items.
-- Common mistakes: 1-2 items.
-- Sources: 2-4 official sources to verify.
+Quick:
+- Summary: 3-5 sentences.
+- CPA impact: 1-2 sentences.
+- Action items: 2-3.
+- Client questions: 1-2.
+- Documentation: 1-2.
+- Risks: 1-2.
+- Common mistakes: 1.
+- Sources: 2-3.
 `;
   }
 
   if (depth === 'deep') {
     return `
-Detailed review mode:
-- Write like an internal CPA research memo.
-- Summary must be detailed but still readable.
-- Include issue framing, federal treatment, state treatment, exceptions, documentation, audit risks, planning notes, and client follow-up questions where relevant.
-- Action items: 8-12 items.
-- Client questions: 5-10 items.
-- Documentation: 6-10 items.
-- Risks: 6-10 items.
-- Common mistakes: 5-8 items.
-- Sources: 6-10 official sources to verify.
-- If the fact pattern is unrealistic, make that the first point in the summary.
+Detailed:
+- Summary: detailed but readable.
+- Include issue framing, federal treatment, state treatment, exceptions, documentation, audit risks, planning notes, and client follow-up where relevant.
+- Action items: 7-10.
+- Client questions: 4-7.
+- Documentation: 4-7.
+- Risks: 5-8.
+- Common mistakes: 4-6.
+- Sources: 5-8.
+- If facts are unrealistic, make that the first point.
 `;
   }
 
   return `
-Standard mode:
-- Give a practical CPA-ready explanation.
-- Summary should be 1-2 solid paragraphs.
-- Include key rule, exceptions, and filing/review impact.
-- Action items: 4-6 items.
-- Client questions: 3-5 items.
-- Documentation: 3-6 items.
-- Risks: 3-5 items.
-- Common mistakes: 2-4 items.
-- Sources: 4-6 official sources to verify.
+Standard:
+- Summary: 1-2 useful paragraphs.
+- Include key rule, exceptions, filing impact, review impact.
+- Action items: 4-5.
+- Client questions: 2-4.
+- Documentation: 2-4.
+- Risks: 2-4.
+- Common mistakes: 2-3.
+- Sources: 3-5.
 `;
+}
+
+function getMaxOutputTokens(depth) {
+  if (depth === 'quick') return 900;
+  if (depth === 'deep') return 2200;
+  return 1400;
+}
+
+function getTimeoutMs(depth) {
+  if (depth === 'quick') return 18000;
+  if (depth === 'deep') return 35000;
+  return 25000;
 }
 
 function normalizeTaxResult(parsed, raw, context) {
@@ -248,7 +267,7 @@ function normalizeTaxResult(parsed, raw, context) {
     summary: raw || 'No result returned.',
     federalTreatment: '',
     stateTreatment: '',
-    cpaImpact: 'Review the underlying official guidance before relying on this result.',
+    cpaImpact: 'Review official guidance before relying on this result.',
     affectedClients: [],
     actionItems: ['Verify the rule against IRS and applicable state guidance.'],
     clientQuestions: [],
@@ -258,31 +277,36 @@ function normalizeTaxResult(parsed, raw, context) {
     sources: []
   };
 
-  if (!parsed || typeof parsed !== 'object') {
-    return fallback;
-  }
+  if (!parsed || typeof parsed !== 'object') return fallback;
 
   return {
     state: asText(parsed.state) || context.stateName || 'Federal',
     taxYear: asText(parsed.taxYear) || context.taxYear || '',
-    confidence: normalizeConfidence(parsed.confidence),
+    confidence: normalizeConfidence(parsed.confidence, context.taxYear),
     factPatternWarning: asText(parsed.factPatternWarning),
     summary: asText(parsed.summary) || fallback.summary,
     federalTreatment: asText(parsed.federalTreatment),
     stateTreatment: asText(parsed.stateTreatment),
     cpaImpact: asText(parsed.cpaImpact) || fallback.cpaImpact,
-    affectedClients: asArray(parsed.affectedClients),
-    actionItems: asArray(parsed.actionItems),
-    clientQuestions: asArray(parsed.clientQuestions),
-    documentation: asArray(parsed.documentation),
-    risks: asArray(parsed.risks),
-    commonMistakes: asArray(parsed.commonMistakes),
+    affectedClients: asArray(parsed.affectedClients, 12),
+    actionItems: asArray(parsed.actionItems, 12),
+    clientQuestions: asArray(parsed.clientQuestions, 10),
+    documentation: asArray(parsed.documentation, 10),
+    risks: asArray(parsed.risks, 10),
+    commonMistakes: asArray(parsed.commonMistakes, 8),
     sources: normalizeSources(parsed.sources)
   };
 }
 
-function normalizeConfidence(value) {
+function normalizeConfidence(value, taxYear) {
   const text = asText(value);
+  const year = Number(taxYear);
+  const currentYear = new Date().getFullYear();
+
+  if (year && year > currentYear && text === 'High') {
+    return 'Medium';
+  }
+
   if (['High', 'Medium', 'Low'].includes(text)) return text;
   return 'Medium';
 }
@@ -293,31 +317,28 @@ function normalizeSources(sources) {
   return sources
     .map(src => {
       if (typeof src === 'string') {
-        return {
-          title: src,
-          url: ''
-        };
+        return { title: src, url: '' };
       }
 
-      if (!src || typeof src !== 'object') {
-        return null;
-      }
+      if (!src || typeof src !== 'object') return null;
 
       return {
-        title: asText(src.title) || asText(src.name) || 'Source to verify',
+        title: asText(src.title) || asText(src.name) || 'Official source to verify',
         url: asText(src.url)
       };
     })
     .filter(Boolean)
-    .slice(0, 12);
+    .filter(src => src.title.length > 3)
+    .slice(0, 10);
 }
 
-function asArray(value) {
+function asArray(value, limit = 12) {
   if (!Array.isArray(value)) return [];
 
   return value
     .map(item => asText(item))
-    .filter(Boolean);
+    .filter(Boolean)
+    .slice(0, limit);
 }
 
 function asText(value) {
@@ -328,14 +349,14 @@ function asText(value) {
 function safeParseJson(text) {
   try {
     return JSON.parse(text);
-  } catch (error) {
+  } catch {
     const start = text.indexOf('{');
     const end = text.lastIndexOf('}');
 
     if (start >= 0 && end > start) {
       try {
         return JSON.parse(text.slice(start, end + 1));
-      } catch (_) {
+      } catch {
         return null;
       }
     }
@@ -353,6 +374,31 @@ function withTimeout(promise, ms) {
       }, ms);
     })
   ]);
+}
+
+function getCached(key) {
+  const entry = taxCache.get(key);
+
+  if (!entry) return null;
+
+  if (Date.now() - entry.createdAt > CACHE_TTL_MS) {
+    taxCache.delete(key);
+    return null;
+  }
+
+  return entry.value;
+}
+
+function setCached(key, value) {
+  if (taxCache.size >= MAX_CACHE_ITEMS) {
+    const firstKey = taxCache.keys().next().value;
+    taxCache.delete(firstKey);
+  }
+
+  taxCache.set(key, {
+    value,
+    createdAt: Date.now()
+  });
 }
 
 function cleanErrorMessage(error) {
