@@ -5,50 +5,21 @@ require('dotenv').config();
 const OpenAI = require('openai');
 
 const app = express();
+
 app.use(cors());
 app.use(express.json({ limit: '3mb' }));
+
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
+  next();
+});
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
 app.get('/', (req, res) => {
-  res.send('ReviewRequest AI backend is running.');
-});
-
-app.post('/ai-insights', async (req, res) => {
-  try {
-    const { hiddenSummary } = req.body;
-
-    if (!hiddenSummary) {
-      return res.status(400).json({ error: 'Missing hiddenSummary.' });
-    }
-
-    const response = await client.responses.create({
-      model: process.env.OPENAI_MODEL || 'gpt-5',
-      input: `
-You are a CPA financial analyst writing a short internal review memo.
-
-Rewrite the analysis below into a polished CPA-style narrative.
-
-Rules:
-- Do not include disclaimers, limitations, notes, or signatures.
-- Do not mention that the analysis is based on provided data.
-- Do not use bullet points.
-- Prioritize the most important review issues first.
-- Focus on financial meaning, not just number changes.
-- Keep it concise: 1 to 2 short paragraphs.
-
-Analysis:
-${hiddenSummary}
-`
-    });
-
-    res.json({ insights: response.output_text });
-  } catch (error) {
-    console.error('AI insights failed:', error);
-    res.status(500).json({ error: error.message || 'AI insights failed.' });
-  }
+  res.send('ReviewRequest Tax Guidance backend is running.');
 });
 
 app.post('/tax-search', async (req, res) => {
@@ -61,6 +32,15 @@ app.post('/tax-search', async (req, res) => {
       depth,
       query
     } = req.body;
+
+    console.log('Tax search body:', {
+      stateCode,
+      stateName,
+      taxYear,
+      clientType,
+      depth,
+      query
+    });
 
     if (!query) {
       return res.status(400).json({ error: 'Missing query.' });
@@ -109,15 +89,18 @@ JSON shape:
 }
 `;
 
-    const response = await client.responses.create({
-      model: process.env.OPENAI_MODEL || 'gpt-5',
-      tools: [
-        {
-          type: 'web_search_preview'
-        }
-      ],
-      input: prompt
-    });
+    const response = await withTimeout(
+      client.responses.create({
+        model: process.env.OPENAI_MODEL || 'gpt-5',
+        tools: [
+          {
+            type: 'web_search_preview'
+          }
+        ],
+        input: prompt
+      }),
+      90000
+    );
 
     const raw = response.output_text || '';
     const result = safeParseJson(raw);
@@ -141,7 +124,51 @@ JSON shape:
     res.json({ result });
   } catch (error) {
     console.error('Tax search failed:', error);
-    res.status(500).json({ error: error.message || 'Tax search failed.' });
+
+    res.status(500).json({
+      error: error.message || 'Tax search failed.'
+    });
+  }
+});
+
+app.post('/ai-insights', async (req, res) => {
+  try {
+    const { hiddenSummary } = req.body;
+
+    if (!hiddenSummary) {
+      return res.status(400).json({ error: 'Missing hiddenSummary.' });
+    }
+
+    const response = await withTimeout(
+      client.responses.create({
+        model: process.env.OPENAI_MODEL || 'gpt-5',
+        input: `
+You are a CPA financial analyst writing a short internal review memo.
+
+Rewrite the analysis below into a polished CPA-style narrative.
+
+Rules:
+- Do not include disclaimers, limitations, notes, or signatures.
+- Do not mention that the analysis is based on provided data.
+- Do not use bullet points.
+- Prioritize the most important review issues first.
+- Focus on financial meaning, not just number changes.
+- Keep it concise: 1 to 2 short paragraphs.
+
+Analysis:
+${hiddenSummary}
+`
+      }),
+      60000
+    );
+
+    res.json({ insights: response.output_text });
+  } catch (error) {
+    console.error('AI insights failed:', error);
+
+    res.status(500).json({
+      error: error.message || 'AI insights failed.'
+    });
   }
 });
 
@@ -164,7 +191,19 @@ function safeParseJson(text) {
   }
 }
 
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => {
+        reject(new Error(`Request timed out after ${ms / 1000} seconds.`));
+      }, ms);
+    })
+  ]);
+}
+
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
