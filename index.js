@@ -65,11 +65,11 @@ Research target:
 - Question: ${query}
 
 Instructions:
-- Prioritize official sources: IRS, Treasury, state department of revenue, state tax agency, official forms/instructions, official notices, official FAQs.
+- Use your tax knowledge to give practical CPA guidance.
+- Prioritize official sources that the CPA should verify, such as IRS, Treasury, state department of revenue, state tax agency, official forms, official instructions, notices, and FAQs.
 - If the topic is state-specific, include federal context only when useful.
-- Distinguish confirmed law/rules from uncertain or pending changes.
-- If you are not sure, say what must be verified.
-- Do not invent citations.
+- Distinguish confirmed rules from items that need verification.
+- Do not invent exact source URLs if you are not sure.
 - Keep it useful for a CPA working inside a client file.
 - ${detailLevel}
 
@@ -84,22 +84,17 @@ JSON shape:
   "actionItems": ["specific next step", "..."],
   "risks": ["risk or uncertainty to verify", "..."],
   "sources": [
-    { "title": "source title", "url": "https://..." }
+    { "title": "source title to verify", "url": "https://..." }
   ]
 }
 `;
 
     const response = await withTimeout(
       client.responses.create({
-        model: process.env.OPENAI_MODEL || 'gpt-5',
-        tools: [
-          {
-            type: 'web_search_preview'
-          }
-        ],
+        model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
         input: prompt
       }),
-      90000
+      45000
     );
 
     const raw = response.output_text || '';
@@ -141,7 +136,7 @@ app.post('/ai-insights', async (req, res) => {
 
     const response = await withTimeout(
       client.responses.create({
-        model: process.env.OPENAI_MODEL || 'gpt-5',
+        model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
         input: `
 You are a CPA financial analyst writing a short internal review memo.
 
@@ -159,7 +154,7 @@ Analysis:
 ${hiddenSummary}
 `
       }),
-      60000
+      45000
     );
 
     res.json({ insights: response.output_text });
